@@ -1,0 +1,18 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.OrderItem = void 0;
+/* eslint-disable prettier/prettier */
+/* eslint-disable @typescript-eslint/explicit-member-accessibility */
+/* eslint-disable prettier/prettier */
+/* eslint-disable max-params */
+class OrderItem {
+    constructor(Sku, Qty, Seller, Price, Name) {
+        this.sku = Sku;
+        this.qty = Qty;
+        this.seller = Seller;
+        this.price = Price;
+        this.name = Name;
+    }
+}
+exports.OrderItem = OrderItem;
+//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiT3JkZXJJdGVtLmpzIiwic291cmNlUm9vdCI6IiIsInNvdXJjZXMiOlsiT3JkZXJJdGVtLnRzIl0sIm5hbWVzIjpbXSwibWFwcGluZ3MiOiI7OztBQUFBLHNDQUFzQztBQUN0QyxxRUFBcUU7QUFDckUsc0NBQXNDO0FBQ3RDLCtCQUErQjtBQUMvQixNQUFhLFNBQVM7SUFPcEIsWUFBWSxHQUFXLEVBQUUsR0FBVyxFQUFFLE1BQWMsRUFBQyxLQUFhLEVBQUMsSUFBWTtRQUM3RSxJQUFJLENBQUMsR0FBRyxHQUFHLEdBQUcsQ0FBQTtRQUNkLElBQUksQ0FBQyxHQUFHLEdBQUcsR0FBRyxDQUFBO1FBQ2QsSUFBSSxDQUFDLE1BQU0sR0FBRyxNQUFNLENBQUE7UUFDcEIsSUFBSSxDQUFDLEtBQUssR0FBRyxLQUFLLENBQUE7UUFDbEIsSUFBSSxDQUFDLElBQUksR0FBRyxJQUFJLENBQUE7SUFDbEIsQ0FBQztDQUNGO0FBZEQsOEJBY0MiLCJzb3VyY2VzQ29udGVudCI6WyIvKiBlc2xpbnQtZGlzYWJsZSBwcmV0dGllci9wcmV0dGllciAqL1xyXG4vKiBlc2xpbnQtZGlzYWJsZSBAdHlwZXNjcmlwdC1lc2xpbnQvZXhwbGljaXQtbWVtYmVyLWFjY2Vzc2liaWxpdHkgKi9cclxuLyogZXNsaW50LWRpc2FibGUgcHJldHRpZXIvcHJldHRpZXIgKi9cclxuLyogZXNsaW50LWRpc2FibGUgbWF4LXBhcmFtcyAqL1xyXG5leHBvcnQgY2xhc3MgT3JkZXJJdGVte1xyXG4gIHNrdTogc3RyaW5nXHJcbiAgcXR5OiBzdHJpbmdcclxuICBzZWxsZXI6IHN0cmluZ1xyXG4gIHByaWNlOiBzdHJpbmdcclxuICBuYW1lOiBzdHJpbmdcclxuXHJcbiAgY29uc3RydWN0b3IoU2t1OiBzdHJpbmcsIFF0eTogc3RyaW5nLCBTZWxsZXI6IHN0cmluZyxQcmljZTogc3RyaW5nLE5hbWU6IHN0cmluZykge1xyXG4gICAgdGhpcy5za3UgPSBTa3VcclxuICAgIHRoaXMucXR5ID0gUXR5XHJcbiAgICB0aGlzLnNlbGxlciA9IFNlbGxlclxyXG4gICAgdGhpcy5wcmljZSA9IFByaWNlXHJcbiAgICB0aGlzLm5hbWUgPSBOYW1lXHJcbiAgfVxyXG59XHJcbiJdfQ==

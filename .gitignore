@@ -1,0 +1,17 @@
+# from repo root
+Set-Content -Path .gitignore -Value @"
+# Node
+node_modules/
+**/node_modules/
+
+# Build / OS
+dist/
+.DS_Store
+Thumbs.db
+
+# Env / logs
+.env
+*.log
+.vscode/
+.idea/
+"@ -Encoding UTF8

@@ -1,0 +1,21 @@
+{
+  "extends": "@vtex/tsconfig",
+  "compilerOptions": {
+    "target": "es2019",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmitOnError": true,
+    "sourceMap": false,
+    "outDir": "./dist",
+    "rootDir": "./",
+    "typeRoots": ["./node_modules/@types", "./typings"],
+    "lib": ["es2019", "dom"],
+    "baseUrl": ".",
+    "paths": {}
+  },
+  "include": ["./typings/*.d.ts", "./**/*.ts"],
+  "exclude": ["node_modules", "dist", "**/*.js"]
+}
