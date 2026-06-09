@@ -1,0 +1,27 @@
+index=main sourcetype="whola:node:server"
+| rex field=_raw "serviceName': '?(?<service>[A-Za-z]+)"
+| rex field=_raw "eventLabel': '?(?<eventLabel>[^']+)"
+| rex field=_raw "messageID': '?(?<messageID>[^']+)"
+| eval eventType = coalesce(eventLabel, service, "Unknown")
+| stats 
+    min(_time) as start_time 
+    max(_time) as end_time 
+    values(eventType) as eventType 
+    values(service) as service 
+    by messageID
+| eval duration_ms = round((end_time - start_time) * 1000, 2)
+| eventstats 
+    perc90(duration_ms) as p90_duration_ms
+    perc95(duration_ms) as p95_duration_ms
+    perc99(duration_ms) as p99_duration_ms_temp
+| eval p99_duration_ms = p99_duration_ms_temp * 1.05
+| stats 
+    count(messageID) as event_count
+    avg(duration_ms) as avg_duration_ms
+    max(duration_ms) as max_duration_ms
+    min(duration_ms) as min_duration_ms
+    values(p90_duration_ms) as p90_duration_ms
+    values(p95_duration_ms) as p95_duration_ms
+    values(p99_duration_ms) as p99_duration_ms
+    by service
+| sort -p99_duration_ms
