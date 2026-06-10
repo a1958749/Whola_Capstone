@@ -1,19 +1,34 @@
 "use strict";
 
 /*
-  HubSpot integration service
-  - sendCartToHubSpot(event, masterdata, options)
-    options = { includeCartItems: boolean, eventLabel: string, forceNote: boolean, actionType: "added"|"removed"|"updated"|null, itemsOverride: array|null, remainingItemsOverride: array|null }
-  - Uses CRM v3 for contact create/update and engagements v1 for notes
-  - Deduping: in-memory + optional masterdata persistence
-  - Only updates the cleaned set of contact properties (no vtex_customer_id, no customer_session_id, no last_visit_date/recent_visit_date)
+  HubSpot integration service — FINAL FIXED VERSION
+
+  ✔ BrandView triggers ONLY from ProductViewed events
+  ✔ Uses ONLY productProperties (no cart fallback)
+  ✔ categoryName preserved exactly as ProductView.js sends it
+  ✔ Structured logging
 */
 
 const axios = require("axios");
 const path = require("path");
 const constants = require(path.join(__dirname, "..", "util", "constants.js"));
+const pageTypeDetection = require(path.join(__dirname, "..", "util", "pageTypeDetection"));
+const logger = require(path.join(__dirname, "..", "util", "logger"));
+const { createBrandViewObject, isMeaningfulValue } = require("./BrandViewService");
 
-const DEDUPE_TTL_MS = 20 * 1000; // 20 seconds
+function logEvent(level, service, messageID, eventLabel, api, msg, extra = {}) {
+  logger[level]({
+    timestamp: new Date().toISOString(),
+    service,
+    messageID,
+    eventLabel,
+    api,
+    msg,
+    ...extra
+  });
+}
+
+const DEDUPE_TTL_MS = 20 * 1000;
 const inMemoryDedupe = new Map();
 const inMemorySessionByEmail = new Map();
 
@@ -35,13 +50,13 @@ async function getLastSeenFromMasterdata(masterdata, email) {
   if (!masterdata || !email) return null;
   try {
     if (typeof masterdata.getDocument === "function") {
-      const doc = await masterdata.getDocument({ dataEntity: "hubspot_dedupe", id: email });
-      console.debug("[HubSpot] masterdata.getDocument result:", doc);
-      return doc || null;
+      return await masterdata.getDocument({
+        dataEntity: "hubspot_dedupe",
+        id: email,
+      });
     }
     return null;
-  } catch (e) {
-    console.debug("[HubSpot] getLastSeenFromMasterdata failed", e?.message || e);
+  } catch {
     return null;
   }
 }
@@ -50,35 +65,38 @@ async function upsertLastSeenToMasterdata(masterdata, email, eventName, tsIso) {
   if (!masterdata || !email) return false;
   try {
     const fields = { id: email, email, eventName, lastSeenAt: tsIso };
+
     if (typeof masterdata.createDocument === "function") {
       try {
-        await masterdata.createDocument({ dataEntity: "hubspot_dedupe", schema: "hubspot_dedupe", fields });
-        console.debug("[HubSpot] masterdata.createDocument succeeded for", email);
+        await masterdata.createDocument({
+          dataEntity: "hubspot_dedupe",
+          schema: "hubspot_dedupe",
+          fields,
+        });
         return true;
-      } catch (createErr) {
-        console.debug("[HubSpot] createDocument failed, trying updateDocument", createErr?.message || createErr);
+      } catch {
         if (typeof masterdata.updateDocument === "function") {
           try {
-            await masterdata.updateDocument({ dataEntity: "hubspot_dedupe", id: email, fields });
-            console.debug("[HubSpot] masterdata.updateDocument succeeded for", email);
+            await masterdata.updateDocument({
+              dataEntity: "hubspot_dedupe",
+              id: email,
+              fields,
+            });
             return true;
-          } catch (updateErr) {
-            console.debug("[HubSpot] updateDocument failed", updateErr?.message || updateErr);
+          } catch {
             return false;
           }
         }
-        return false;
       }
     }
     return false;
-  } catch (e) {
-    console.debug("[HubSpot] upsertLastSeenToMasterdata failed", e?.message || e);
+  } catch {
     return false;
   }
 }
 
 // -----------------------------
-// Contact helpers (CRM v3)
+// Contact helpers
 // -----------------------------
 async function searchContactByEmailV3(email) {
   try {
@@ -88,473 +106,380 @@ async function searchContactByEmailV3(email) {
       properties: ["email"],
       limit: 1,
     };
-    console.debug("[HubSpot] searchContactByEmailV3 payload:", JSON.stringify(payload));
-    const res = await http.post("https://api.hubapi.com/crm/v3/objects/contacts/search", payload);
-    console.debug("[HubSpot] searchContactByEmailV3 response:", res.status, JSON.stringify(res.data));
-    if (res.data && res.data.total > 0 && Array.isArray(res.data.results) && res.data.results.length > 0) {
+
+    const res = await http.post(
+      "https://api.hubapi.com/crm/v3/objects/contacts/search",
+      payload
+    );
+
+    if (res.data?.total > 0 && res.data.results?.length > 0) {
       return res.data.results[0].id;
     }
     return null;
-  } catch (err) {
-    console.error("[HubSpot] searchContactByEmailV3 failed:", err?.response?.status, err?.response?.data || err?.message || err);
+  } catch {
     return null;
-  }
-}
-
-async function createContactV3(props) {
-  try {
-    const http = getHttp();
-    const payload = { properties: props };
-    console.debug("[HubSpot] createContactV3 payload:", JSON.stringify(payload));
-    const res = await http.post("https://api.hubapi.com/crm/v3/objects/contacts", payload);
-    console.debug("[HubSpot] createContactV3 response:", res.status, JSON.stringify(res.data));
-    return { ok: true, id: res.data.id, data: res.data };
-  } catch (err) {
-    console.error("[HubSpot] createContactV3 failed:", err?.response?.status, err?.response?.data || err?.message || err);
-    return { ok: false, error: err?.response?.data || err?.message || err };
   }
 }
 
 async function createContactV3_simple(email) {
-  // backward-compatible helper if only email is provided
   try {
     const http = getHttp();
     const body = { properties: { email } };
-    console.debug("[HubSpot] createContactV3_simple payload:", JSON.stringify(body));
     const res = await http.post(constants.HUBSPOT_CREATE_CONTACT_URL, body);
-    console.debug("[HubSpot] createContactV3_simple response:", res.status, JSON.stringify(res.data));
     return res.data?.id || null;
-  } catch (err) {
-    console.error("[HubSpot] createContactV3_simple failed:", err?.response?.status, err?.response?.data || err?.message || err);
+  } catch {
     return null;
   }
 }
 
 async function ensureContactByEmail(email) {
   if (!email) return null;
+
   let contactId = await searchContactByEmailV3(email);
   if (!contactId) {
-    console.debug("[HubSpot] contact not found, creating for email:", email);
-    const created = await createContactV3_simple(email);
-    contactId = created || null;
-    if (contactId) console.debug("[HubSpot] contact created id:", contactId);
-    else console.warn("[HubSpot] contact creation failed for email:", email);
-  } else {
-    console.debug("[HubSpot] contact found id:", contactId);
+    contactId = await createContactV3_simple(email);
   }
   return contactId;
 }
 
-// Update contact properties (skip unknown or empty props)
 async function updateContactPropertiesV3(contactId, propertiesObj) {
-  if (!contactId) {
-    console.warn("[HubSpot] updateContactPropertiesV3 missing contactId");
-    return { ok: false };
-  }
+  if (!contactId) return { ok: false };
+
   const http = getHttp();
   const url = `${constants.HUBSPOT_UPDATE_CONTACT_URL}${contactId}`;
   const payload = { properties: {} };
 
-  // Only include non-empty values in the payload to avoid overwriting existing HubSpot properties with empty strings.
   for (const k of Object.keys(propertiesObj || {})) {
-    const val = propertiesObj[k];
-    if (val === undefined || val === null) continue;
-    const str = String(val).trim();
-    if (str === "") continue; // skip empty strings
-    payload.properties[k] = str;
+    const v = propertiesObj[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") {
+      payload.properties[k] = String(v).trim();
+    }
   }
 
-  // If nothing to update, return early
   if (Object.keys(payload.properties).length === 0) {
-    console.debug("[HubSpot] updateContactPropertiesV3: nothing to update (all values empty or null)");
     return { ok: true, skipped: true };
   }
 
   try {
-    console.debug("[HubSpot] updateContactPropertiesV3 request:", url, JSON.stringify(payload));
     const res = await http.patch(url, payload);
-    console.debug("[HubSpot] updateContactPropertiesV3 success:", res.status, JSON.stringify(res.data));
     return { ok: true, data: res.data };
   } catch (err) {
-    const resp = err?.response?.data;
-    console.warn("[HubSpot] updateContactPropertiesV3 failed:", err?.response?.status, resp || err?.message || err);
-    return { ok: false, error: resp || err?.message || err };
+    return { ok: false, error: err?.response?.data || err?.message || err };
   }
 }
 
 // -----------------------------
-// Engagements v1 note creator (HTML-friendly)
+// Timeline note creator
 // -----------------------------
 function sumCartValue(itemsArr) {
   if (!Array.isArray(itemsArr) || itemsArr.length === 0) return 0;
-  // price is expected in cents (integer). Multiply by qty, sum, then divide by 100.
-  const totalCents = itemsArr.reduce((acc, it) => {
-    const price = Number(it.price || 0);
-    const qty = Number(it.qty || it.quantity || 1);
-    return acc + (price * qty);
-  }, 0);
-  return totalCents / 100;
+  return (
+    itemsArr.reduce((acc, it) => acc + (Number(it.price || 0) * Number(it.qty || 1)), 0) / 100
+  );
 }
 
 function formatCurrency(amount) {
   return `$${Number(amount).toFixed(2)}`;
 }
 
-async function addTimelineNoteV1(contactId, items, eventLabel = "Cart Updated", productProperties = {}, includeCartItems = false, actionType = null, remainingItems = null) {
-  // Prefer explicit productProperties name; fallback to first item name/sku when needed
-  let productName = (productProperties && (productProperties.productName || productProperties.name)) || "";
-  const brand = productProperties?.brandName || productProperties?.brand || "";
+async function addTimelineNoteV1(
+  contactId,
+  items,
+  eventLabel = "Cart Updated",
+  productProperties = {},
+  includeCartItems = false,
+  actionType = null,
+  remainingItems = null
+) {
+  const http = getHttp();
 
-  // If productName missing, try to use first item name (useful for added notes when productProperties absent)
-  if (!productName && Array.isArray(items) && items.length > 0) {
-    const first = items.find(i => i.name || i.productName || i.sku);
-    if (first) {
-      productName = first.name || first.productName || first.sku || "";
-    }
-  }
+  let productName =
+    productProperties.productName ||
+    productProperties.name ||
+    (items?.[0]?.name || items?.[0]?.productName || items?.[0]?.sku || "");
 
-  // Helper: format items block (single-line per item)
-  const formatItemsBlock = (itemsArr) => {
-    return itemsArr
-      .map(i => {
-        const price = (i.price || 0);
-        const priceStr = (typeof price === "number" && price !== 0) ? `$${(price / 100).toFixed(2)}` : (price ? String(price) : "no price");
-        const variantInfo = i.variant || i.variantName || i.skuVariant || "";
-        const variantSuffix = variantInfo ? ` ${variantInfo}` : "";
-        const namePart = i.name || i.productName || "";
-        return `${i.sku || i.skuId || i.itemId || "unknown"} x ${i.qty || i.quantity || 1} (${priceStr}) — ${namePart}${variantSuffix}`;
+  const brand = productProperties.brandName || productProperties.brand || "";
+
+  const formatItemsBlock = (arr) =>
+    arr
+      .map((i) => {
+        const price = i.price || 0;
+        const priceStr = price ? `$${(price / 100).toFixed(2)}` : "no price";
+        return `${i.sku || "unknown"} x ${i.qty || 1} (${priceStr}) — ${i.name || ""}`;
       })
       .join("\n");
-  };
 
-  // Compose note parts
   const noteParts = [];
 
-  // Treat Login and Logout explicitly
   if (!includeCartItems && (eventLabel === "Login" || eventLabel === "Logout")) {
-    const pageText = productProperties?.productName || productProperties?.name || productProperties?.brandName || "Home";
+    const pageText =
+      productProperties.productName ||
+      productProperties.name ||
+      productProperties.brandName ||
+      "Home";
     const verb = eventLabel === "Login" ? "Logged-in" : "Logged-out";
     noteParts.push(`🛍️ Customer ${verb}: ${pageText}`);
   } else if (includeCartItems) {
     if (actionType === "removed") {
-      const removedItems = Array.isArray(items) ? items : [];
-      const pluralHeader = removedItems.length > 1 ? "Products removed from Cart" : "Product removed from Cart";
-      const headerItemText = removedItems.length === 1
-        ? (removedItems[0].name || removedItems[0].productName || removedItems[0].sku || "unknown")
-        : removedItems.map(it => (it.name || it.productName || it.sku || "unknown")).join("; ");
+      const removedBlock = formatItemsBlock(items);
+      noteParts.push(`🗑️ Product removed from Cart`);
+      if (removedBlock) noteParts.push(`Removed Items:\n${removedBlock}`);
 
-      noteParts.push(`🗑️ ${pluralHeader} : ${headerItemText}`);
-
-      if (removedItems.length > 0) {
-        const removedBlock = formatItemsBlock(removedItems);
-        if (removedBlock) noteParts.push(`Removed Items:\n${removedBlock}`);
+      const remainingBlock = remainingItems ? formatItemsBlock(remainingItems) : "";
+      if (remainingBlock) {
+        noteParts.push(`🛒 Updated Cart : ${remainingBlock}`);
+        noteParts.push(`Cart Value : ${formatCurrency(sumCartValue(remainingItems))}`);
       }
-
-      const remaining = Array.isArray(remainingItems) ? remainingItems : [];
-      if (remaining.length > 0) {
-        const remainingText = formatItemsBlock(remaining);
-        noteParts.push(`🛒 Updated Cart : ${remainingText}`);
-        const cartValue = sumCartValue(remaining);
-        noteParts.push(`Cart Value : ${formatCurrency(cartValue)}`);
-      } else {
-        noteParts.push(`🛒 Updated Cart : (no items)`);
-      }
-
     } else {
-      // ADDED or UPDATED
-      if (actionType === "added") {
-        if (productName) noteParts.push(`➕ Product added to cart : ${productName}${brand ? ` (${brand})` : ""}`);
-        else noteParts.push(`➕ Product added to cart`);
-      } else {
-        if (productName) noteParts.push(`Product updated in cart : ${productName}${brand ? ` (${brand})` : ""}`);
-        else noteParts.push(`${eventLabel}`);
-      }
+      noteParts.push(
+        productName
+          ? `➕ Product added to cart : ${productName}${brand ? ` (${brand})` : ""}`
+          : "➕ Product added to cart"
+      );
 
-      if (Array.isArray(items) && items.length > 0) {
-        const itemsText = formatItemsBlock(items);
-        noteParts.push(`🛒 Updated Cart : ${itemsText}`);
-        const cartValue = sumCartValue(items);
-        noteParts.push(`Cart Value : ${formatCurrency(cartValue)}`);
+      const itemsBlock = formatItemsBlock(items);
+      if (itemsBlock) {
+        noteParts.push(`🛒 Updated Cart : ${itemsBlock}`);
+        noteParts.push(`Cart Value : ${formatCurrency(sumCartValue(items))}`);
       }
     }
   } else {
-    // Product view formatting (no cart items)
-    if (productName) noteParts.push(`🛍️ Product viewed: ${productName}${brand ? ` (${brand})` : ""}`);
-    else noteParts.push(`🛍️ ${eventLabel}`);
+    noteParts.push(
+      productName
+        ? `🛍️ ${eventLabel}: ${productName}${brand ? ` (${brand})` : ""}`
+        : `🛍️ ${eventLabel}`
+    );
   }
 
-  // Plain text fallback
-  const noteBodyPlain = noteParts.join("\n\n");
-
-  // Build HTML body: escape and replace newlines with <br>, wrap blocks in divs
-  const htmlEscape = (s) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const htmlEscape = (s) =>
+    String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const noteBodyHtml = noteParts
-    .map(part => htmlEscape(part).replace(/\n/g, "<br>"))
-    .map(p => `<div style="margin-bottom:8px;">${p}</div>`)
+    .map((p) => `<div style="margin-bottom:8px;">${htmlEscape(p).replace(/\n/g, "<br>")}</div>`)
     .join("");
 
   try {
-    const http = getHttp();
     const payload = {
       engagement: { type: "NOTE" },
       associations: { contactIds: [Number(contactId)] },
-      // Use HTML body so HubSpot UI renders line breaks and blocks
-      metadata: { body: noteBodyHtml || htmlEscape(noteBodyPlain) },
+      metadata: { body: noteBodyHtml },
     };
-    console.debug("[HubSpot] addTimelineNoteV1 request payload:", JSON.stringify(payload));
+
     const res = await http.post("https://api.hubapi.com/engagements/v1/engagements", payload);
-    console.debug("[HubSpot] addTimelineNoteV1 response:", res.status, JSON.stringify(res.data));
-    const engagementId = res.data && (res.data.engagement?.id || res.data?.engagementId || res.data?.id) || null;
-    console.log("[HubSpot] Note created (v1) engagementId:", engagementId);
-    return { ok: true, data: res.data, engagementId };
+    return { ok: true, data: res.data };
   } catch (err) {
-    console.warn("[HubSpot] addTimelineNoteV1 failed", err?.response?.data || err?.message || err);
     return { ok: false, error: err?.response?.data || err?.message || err };
   }
 }
 
-// Normalize cart status values to canonical set
-function normalizeCartStatus(raw) {
-  if (!raw) return "";
-  const s = String(raw).trim().toLowerCase();
-  if (s.includes("abandon")) return "Abandoned Cart";
-  if (s.includes("active")) return "Active Cart";
-  if (s.includes("no") || s.includes("none") || s.includes("empty")) return "No Cart";
-  // fallback: capitalize words
-  return raw.split(/\s+/).map(w => w[0]?.toUpperCase() + w.slice(1)).join(" ");
-}
-
 // -----------------------------
-// Main entrypoint: sendCartToHubSpot(event, masterdata, options)
-// options: { includeCartItems: boolean, eventLabel: string, forceNote: boolean, actionType: "added"|"removed"|"updated"|null, itemsOverride: array|null, remainingItemsOverride: array|null }
+// Main entrypoint
 // -----------------------------
 async function sendCartToHubSpot(event, masterdata, options = {}) {
   const includeCartItems = !!options.includeCartItems;
   const eventLabel = options.eventLabel || "Activity";
-  const forceNote = !!options.forceNote;
+  const serviceName = options.serviceName || "HubSpot";
+  const messageID = options.messageID || Date.now().toString();
   const actionType = options.actionType || null;
-  const itemsOverride = Array.isArray(options.itemsOverride) ? options.itemsOverride : null;
-  const remainingItemsOverride = Array.isArray(options.remainingItemsOverride) ? options.remainingItemsOverride : null;
 
-  console.debug("[HubSpot] sendCartToHubSpot invoked. event present:", !!event, "masterdata present:", !!masterdata, "options:", options);
+  logEvent("info", serviceName, messageID, eventLabel, "hubspot:start", "sendCartToHubSpot invoked", {
+    includeCartItems,
+    actionType,
+  });
 
   try {
-    if (!event || !event.customerProperties) {
-      console.warn("[HubSpot] Missing event.customerProperties — skipping");
-      return { ok: false, reason: "missing_event" };
+    if (!event?.customerProperties) {
+      logEvent("warn", serviceName, messageID, eventLabel, "hubspot:skip", "Missing event.customerProperties");
+      return { ok: false };
     }
 
     const email = event.customerProperties.email;
     if (!email) {
-      console.warn("[HubSpot] Missing email — skipping");
-      return { ok: false, reason: "missing_email" };
+      logEvent("warn", serviceName, messageID, eventLabel, "hubspot:skip", "Missing email");
+      return { ok: false };
     }
 
-    const eventName = (event.customerProperties.lastActivityType || "product_view").toString().toLowerCase();
+    const eventName = (event.customerProperties.lastActivityType || "product_view").toLowerCase();
     const now = Date.now();
-    let lastSeenTs = null;
 
-    // Check masterdata dedupe if available
+    let lastSeenTs = null;
     let masterdataLastSeen = null;
+
     if (masterdata) {
-      try {
-        masterdataLastSeen = await getLastSeenFromMasterdata(masterdata, email);
-        if (masterdataLastSeen && masterdataLastSeen.lastSeenAt) lastSeenTs = new Date(masterdataLastSeen.lastSeenAt).getTime();
-      } catch (e) {
-        console.debug("[HubSpot] masterdata read error (ignored)", e?.message || e);
+      masterdataLastSeen = await getLastSeenFromMasterdata(masterdata, email);
+      if (masterdataLastSeen?.lastSeenAt) {
+        lastSeenTs = new Date(masterdataLastSeen.lastSeenAt).getTime();
       }
     } else {
       const entry = inMemoryDedupe.get(email);
-      if (entry && entry.eventName === eventName) lastSeenTs = entry.ts;
+      if (entry?.eventName === eventName) lastSeenTs = entry.ts;
     }
 
-    if (!forceNote && lastSeenTs && (now - lastSeenTs) < DEDUPE_TTL_MS) {
-      console.debug("[HubSpot] Duplicate event suppressed by dedupe", { email, eventName, lastSeenTs, now });
-      return { ok: false, reason: "deduped" };
+    if (!options.forceNote && lastSeenTs && now - lastSeenTs < DEDUPE_TTL_MS) {
+      logEvent("info", serviceName, messageID, eventLabel, "hubspot:dedupe", "Duplicate suppressed");
+      return { ok: false };
     }
 
-    // Ensure contact exists (create if missing)
-    let contactId = await searchContactByEmailV3(email);
-    if (!contactId) {
-      console.debug("[HubSpot] contact not found, creating for email:", email);
-      const created = await createContactV3_simple(email);
-      contactId = created || null;
-      if (contactId) console.debug("[HubSpot] contact created id:", contactId);
-      else console.warn("[HubSpot] contact creation failed for email:", email);
-    } else {
-      console.debug("[HubSpot] contact found id:", contactId);
-    }
+    let contactId = await ensureContactByEmail(email);
 
-    // Compute customer_type (internal only). Use inMemorySessionByEmail + masterdata lastSeen date as heuristics.
-    const currentSessionId = event.customerProperties?.sessionId || "";
+    // -----------------------------
+    // Contact classification
+    // -----------------------------
+    const currentSessionId = event.customerProperties.sessionId || "";
     const today = new Date().toISOString().split("T")[0];
 
     let computedCustomerType = "New";
-    if (!contactId) {
-      computedCustomerType = "New";
-    } else {
+    if (contactId) {
       const prevSession = inMemorySessionByEmail.get(email) || "";
       if (currentSessionId && prevSession && currentSessionId !== prevSession) {
         computedCustomerType = "Returning";
+      } else if (masterdataLastSeen?.lastSeenAt) {
+        const lastSeenDate = new Date(masterdataLastSeen.lastSeenAt).toISOString().split("T")[0];
+        computedCustomerType = lastSeenDate !== today ? "Frequent" : "Returning";
       } else {
-        if (masterdataLastSeen && masterdataLastSeen.lastSeenAt) {
-          const lastSeenDate = new Date(masterdataLastSeen.lastSeenAt).toISOString().split("T")[0];
-          if (lastSeenDate !== today) computedCustomerType = "Frequent";
-          else computedCustomerType = "Returning";
-        } else {
-          computedCustomerType = "Returning";
-        }
+        computedCustomerType = "Returning";
       }
     }
 
     // -----------------------------
-    // Decide whether to update last_* contact properties
+    // Page / product / brand flags
     // -----------------------------
-    // Determine if this event should be considered a product view for updating last_* fields.
-    const rawLastActivity = (event.customerProperties?.lastActivityType || "").toString().toLowerCase();
-    const isProductViewEvent = rawLastActivity.includes("product view")
-      || rawLastActivity.includes("product_view")
-      || (options && options.eventLabel === "Product Viewed")
-      || (options && options.forceNote && !!(event.productProperties && event.productProperties.productName));
+    const rawLastActivity = (event.customerProperties.lastActivityType || "").toLowerCase();
+    const pageUrl =
+      event.customerProperties.lastVisitedUrl ||
+      event.customerProperties.lastVisitedPage ||
+      "";
+    const explicitPageType = (event.customerProperties.pageType || "").toLowerCase();
 
-    // Grab product/brand/category from payload (trimmed)
-    const rawProductName = (event.productProperties?.productName || "").toString().trim();
-    const rawBrandName = (event.productProperties?.brandName || "").toString().trim();
-    const rawCategoryName = (event.productProperties?.categoryName || "").toString().trim();
+    const detectedPageType = pageTypeDetection.detectPageType({
+      pageUrl,
+      productProps: event.productProperties || {},
+      jsonLd: event.jsonLdProduct || null,
+    });
 
-    // Optional: list of weak fallbacks to ignore (site name, placeholders)
-    const WEAK_FALLBACKS = new Set(["whola", "home", "homepage", "site", "default"]);
+    const pageType = explicitPageType || detectedPageType || "page";
 
-    // Helper: meaningful value check
-    function isMeaningful(val) {
-      if (!val) return false;
-      const lower = val.toLowerCase();
-      if (WEAK_FALLBACKS.has(lower)) return false;
-      // skip single-character or obviously invalid values
-      if (lower.length <= 1) return false;
-      // skip values that are just numbers or placeholders like "product"
-      if (/^\d+$/.test(lower)) return false;
-      if (lower === "product" || lower === "item") return false;
-      return true;
-    }
+    const isActivityProductView =
+      rawLastActivity.includes("product view") ||
+      rawLastActivity.includes("product_view") ||
+      eventLabel === "Product Viewed";
 
-    // Build cleaned contact properties but only set last_* when this is a product view and values are meaningful
+    const isProductPage = pageType === "product";
+
+    const rawProductName = (event.productProperties?.productName || "").trim();
+    const rawBrandName = (event.productProperties?.brandName || "").trim();
+    const rawCategoryName = (event.productProperties?.categoryName || "").trim();
+    const rawProductId = (event.productProperties?.productId || "").trim();
+
+    const hasProductId = !!rawProductId;
+    const hasMeaningfulBrand = isMeaningfulValue(rawBrandName);
+
+    const isProductBrandViewEligible =
+      isProductPage && (hasProductId || hasMeaningfulBrand);
+
+    // -----------------------------
+    // Contact properties
+    // -----------------------------
     const contactPropsRaw = {
-      email: email,
-      last_activity_type: event.customerProperties?.lastActivityType || "Product view",
+      email,
+      last_activity_type: event.customerProperties.lastActivityType || eventLabel,
       last_product_viewed: null,
       last_brand_viewed: null,
       last_category_viewed: null,
-      cart_status: normalizeCartStatus(event.cartProperties?.cartStatus || ""),
+      cart_status: event.cartProperties?.cartStatus || "",
       customer_type: computedCustomerType,
     };
 
-    // Only set last_* if this is a product view (or forced product note) AND the values are meaningful
-    if (isProductViewEvent) {
-      if (isMeaningful(rawProductName)) contactPropsRaw.last_product_viewed = rawProductName;
-      if (isMeaningful(rawBrandName)) contactPropsRaw.last_brand_viewed = rawBrandName;
-      if (isMeaningful(rawCategoryName)) contactPropsRaw.last_category_viewed = rawCategoryName;
-    } else {
-      // Not a product view: do not set last_* fields (preserve existing HubSpot values)
-      console.debug("[HubSpot] Event is not a product view; skipping last_* property assignment");
+    if (isProductBrandViewEligible && isActivityProductView) {
+      if (isMeaningfulValue(rawProductName)) contactPropsRaw.last_product_viewed = rawProductName;
+      if (hasMeaningfulBrand) contactPropsRaw.last_brand_viewed = rawBrandName;
+      if (isMeaningfulValue(rawCategoryName)) contactPropsRaw.last_category_viewed = rawCategoryName;
     }
 
-    // Filter out empty/null values so we don't overwrite existing HubSpot properties with blanks
     const contactProps = {};
     for (const k of Object.keys(contactPropsRaw)) {
       const v = contactPropsRaw[k];
-      if (v === undefined || v === null) continue;
-      const s = String(v).trim();
-      if (s === "") continue;
-      contactProps[k] = s;
-    }
-
-    if (Object.keys(contactProps).length === 0) {
-      console.debug("[HubSpot] No non-empty contact properties to upsert; contact update will be skipped");
-    } else {
-      console.debug("[HubSpot] Contact properties to upsert:", contactProps);
-    }
-
-    // Upsert contact properties
-    try {
-      if (!contactId) {
-        // create contact with only non-empty props (if any)
-        const createProps = { email };
-        Object.assign(createProps, contactProps);
-        const createRes = await createContactV3(createProps);
-        if (createRes.ok) {
-          contactId = createRes.id;
-          console.log("[HubSpot] Created new contact id:", contactId);
-        } else {
-          console.warn("[HubSpot] createContactV3 failed, continuing to note creation if possible", createRes.error);
-        }
-      } else {
-        // update only non-empty props; updateContactPropertiesV3 will skip if nothing to update
-        const updateRes = await updateContactPropertiesV3(contactId, contactProps);
-        if (updateRes.ok) {
-          if (updateRes.skipped) console.debug("[HubSpot] updateContactPropertiesV3 skipped (no non-empty props)");
-          else console.log("[HubSpot] Updated contact id:", contactId);
-        } else {
-          console.warn("[HubSpot] updateContactPropertiesV3 failed", updateRes.error);
-        }
+      if (v !== undefined && v !== null && String(v).trim() !== "") {
+        contactProps[k] = String(v).trim();
       }
-    } catch (err) {
-      console.error("[HubSpot] contact upsert error:", err?.message || err);
     }
 
-    // Persist session in-memory for future customer_type computation (internal only)
+    logEvent("info", serviceName, messageID, eventLabel, "hubspot:contactUpdate", "Updating contact", {
+      contactProps,
+    });
+
+    if (!contactId) {
+      const createRes = await createContactV3_simple(email);
+      contactId = createRes || null;
+    } else {
+      await updateContactPropertiesV3(contactId, contactProps);
+    }
+
     if (currentSessionId) inMemorySessionByEmail.set(email, currentSessionId);
 
-    // Build items for note (if includeCartItems)
-    // Use itemsOverride when provided (CartEvents will pass removed-only items for removals)
-    const items = itemsOverride !== null ? itemsOverride : ((event.cartProperties && event.cartProperties.items) || []);
-    const productProps = event.productProperties || {};
-    const remainingItems = remainingItemsOverride !== null ? remainingItemsOverride : null;
+    // -----------------------------
+    // brand_view creation — ONLY for ProductViewed
+    // -----------------------------
+    if (serviceName === "ProductViewed" && isProductBrandViewEligible && contactId) {
+      logEvent("info", "BrandView", messageID, eventLabel, "hubspot:brandView", "Creating brand_view");
 
-    // Create timeline note (only one note per call, controlled by includeCartItems)
-    let noteResult = null;
-    try {
-      if (!contactId) {
-        // try one more time to find contact id
-        contactId = await searchContactByEmailV3(email);
-      }
-      if (!contactId) {
-        console.warn("[HubSpot] No contactId available; skipping timeline note creation");
-        noteResult = { ok: false, reason: "no_contact_id" };
-      } else {
-        // Pass actionType and remainingItems through to the note creator
-        noteResult = await addTimelineNoteV1(contactId, items, eventLabel, productProps, includeCartItems, actionType, remainingItems);
-      }
-    } catch (err) {
-      console.error("[HubSpot] timeline note creation error:", err?.message || err);
-      noteResult = { ok: false, error: err };
+      // ⭐ Use ONLY productProperties exactly as ProductView.js sent them
+      const brandEvent = {
+        ...event,
+        productProperties: event.productProperties,
+      };
+
+      await createBrandViewObject(
+        brandEvent,
+        contactId,
+        "p442999208_brand_view",
+        "p442999208_brand_view_to_contact",
+        { eventLabel, messageID }
+      );
     }
 
-    // Update in-memory dedupe and masterdata
-    try {
-      inMemoryDedupe.set(email, { ts: now, eventLabel });
-      await upsertLastSeenToMasterdata(masterdata, email, eventName, new Date(now).toISOString());
-    } catch (e) {
-      console.debug("[HubSpot] dedupe persistence failed", e?.message || e);
-    }
+    // -----------------------------
+    // Timeline note
+    // -----------------------------
+    const items =
+      options.itemsOverride !== null
+        ? options.itemsOverride
+        : event.cartProperties?.items || [];
 
-    console.log("[HubSpot] sendCartToHubSpot processed for", email);
+    const remainingItems =
+      options.remainingItemsOverride !== null ? options.remainingItemsOverride : null;
+
+    logEvent("info", serviceName, messageID, eventLabel, "hubspot:timelineNote", "Creating timeline note");
+
+    const noteResult = await addTimelineNoteV1(
+      contactId,
+      items,
+      eventLabel,
+      event.productProperties || {},
+      includeCartItems,
+      actionType,
+      remainingItems
+    );
+
+    inMemoryDedupe.set(email, { ts: now, eventName });
+    await upsertLastSeenToMasterdata(masterdata, email, eventName, new Date(now).toISOString());
+
+    logEvent("info", serviceName, messageID, eventLabel, "hubspot:done", "sendCartToHubSpot completed");
+
     return {
-      ok: !!(noteResult && noteResult.ok),
+      ok: !!noteResult.ok,
       contactId,
       noteResult,
     };
   } catch (err) {
-    console.error("[HubSpot] sendCartToHubSpot unhandled error", err?.response?.data || err?.message || err);
+    logEvent("error", serviceName, messageID, eventLabel, "hubspot:error", "Unhandled error", { err });
     return { ok: false, error: err };
   }
 }
 
 module.exports = {
   sendCartToHubSpot,
-  // Exported for tests or other modules if needed
   searchContactByEmailV3,
-  createContactV3,
+  createContactV3_simple,
   updateContactPropertiesV3,
   addTimelineNoteV1,
 };
