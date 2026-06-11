@@ -1,4 +1,4 @@
-// background.js - FINAL VERSION (HubSpot tracking removed)
+// background.js - UPDATED (route Cart Updated + login/logout + product views correctly)
 
 const DEFAULTS = {
   middlewareUrl: "http://localhost:4000",
@@ -24,6 +24,52 @@ function readConfig() {
   });
 }
 
+// Decide route based on payload content
+function chooseRouteForPayload(baseUrl, payload) {
+  const base = baseUrl.replace(/\/$/, "");
+  const la = (payload?.customerProperties?.lastActivityType || "").toLowerCase();
+  const pageType = (payload?.customerProperties?.pageType || "").toLowerCase();
+
+  // 1) LOGIN / LOGOUT → CartEvents
+  if (
+    la.includes("login") ||
+    la.includes("logout") ||
+    la.includes("signed in") ||
+    la.includes("sign in") ||
+    la.includes("sign out") ||
+    la.includes("signed out")
+  ) {
+    return `${base}/_v/cart-events`;
+  }
+
+  // 2) CART UPDATED (including empty cart) → CartEvents
+  if (la.includes("cart updated")) {
+    return `${base}/_v/cart-events`;
+  }
+
+  // 3) PRODUCT VIEW → ProductView
+  if (la.includes("product view") || pageType === "product") {
+    return `${base}/_v/product-view`;
+  }
+
+  // 4) CART UPDATES inferred only from items (fallback) → CartEvents
+  const hasItems =
+    Array.isArray(payload?.cartProperties?.items) &&
+    payload.cartProperties.items.length > 0;
+
+  if (hasItems) {
+    return `${base}/_v/cart-events`;
+  }
+
+  // 5) BRAND PAGE → PageViews (brand_view handled inside sendCartToHubSpot)
+  if (pageType === "brand") {
+    return `${base}/_v/page-views`;
+  }
+
+  // 6) CATEGORY / PAGE / HOME / OTHER → PageViews
+  return `${base}/_v/page-views`;
+}
+
 // Main message handler
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 1) Forward events to middleware
@@ -31,16 +77,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         const cfg = await readConfig();
-        const target = cfg.middlewareUrl.replace(/\/$/, "") + "/_v/cart-events";
+        const target = chooseRouteForPayload(cfg.middlewareUrl, msg.payload);
 
         const res = await fetch(target, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-Whola-Raw-Capture":
+              msg.payload && msg.payload.rawCapture ? "1" : "0",
+          },
           body: JSON.stringify(msg.payload),
         });
 
         const text = await res.text();
-        sendResponse({ status: res.status, body: text });
+        sendResponse({ status: res.status, body: text, target });
       } catch (err) {
         sendResponse({ status: 0, error: String(err) });
       }

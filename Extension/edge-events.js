@@ -159,7 +159,6 @@ if (window.__WHOLA_EDGE_EVENTS_LOADED__) {
      ------------------------- */
 
   async function captureProductView(product = {}) {
-    // This function remains compatible with previous behavior.
     const profile = Object.assign({}, loadWholaUser() || {});
     const email = product.email || profile.email || localStorage.getItem('whola_email') || null;
     const hubspotContactId = product.hubspotContactId || profile.hubspotContactId || null;
@@ -192,9 +191,7 @@ if (window.__WHOLA_EDGE_EVENTS_LOADED__) {
     return sendToMiddleware(payload);
   }
 
-  // New: manual captureLogin and captureLogout helpers that other scripts can call
   async function captureLogin(payload = {}) {
-    // payload may include email, cart, product; otherwise page-capture will detect
     const base = Object.assign({}, payload);
     base.customerProperties = base.customerProperties || {};
     base.customerProperties.lastActivityType = 'Login';
@@ -208,14 +205,9 @@ if (window.__WHOLA_EDGE_EVENTS_LOADED__) {
     return sendToMiddleware(base);
   }
 
-  // Expose the helpers
   expose('captureProductView', captureProductView);
   expose('captureLogin', captureLogin);
   expose('captureLogout', captureLogout);
-
-  /* -------------------------
-     Auto Init
-     ------------------------- */
 
   console.debug('edge-events: loaded and API exposed (captureLogin/captureLogout available)');
 

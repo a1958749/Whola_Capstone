@@ -1,13 +1,9 @@
-// page-capture.js
-// Capture layer with login/logout detection and cart-status logic.
-// Injected into page MAIN world.
-
+// page-capture.js (client MAIN world) — conservative capture + login/logout + cart updates
 (function () {
-  const MIDDLEWARE_URL = window.__MIDDLEWARE_URL__ || null;
   const LAST_SENT_KEY = "__WHOLA_LAST_SENT__";
   const LAST_KNOWN_EMAIL_KEY = "__WHOLA_LAST_KNOWN_EMAIL__";
+  const LAST_CART_HASH_KEY = "__WHOLA_LAST_CART_HASH__";
 
-  // --- Utilities ---
   function safeStringify(obj) {
     try {
       return JSON.stringify(obj);
@@ -23,7 +19,7 @@
     }
   }
 
-  function simpleHash(str) {
+  function hashString(str) {
     let h = 2166136261 >>> 0;
     for (let i = 0; i < str.length; i++) {
       h ^= str.charCodeAt(i);
@@ -32,42 +28,86 @@
     return h.toString(16);
   }
 
-  // --- Data extraction helpers (minimal, robust) ---
+  function detectPageTypeClient(pageUrl, product) {
+    const url = (pageUrl || "").toString().toLowerCase();
+    if (!url) return "page";
+    if (url.endsWith("/p")) return "product";
+    if (url.includes("/brands") || url.includes("/brand/")) return "brand";
+    const categoryKeywords = [
+      "womens",
+      "women",
+      "mens",
+      "men",
+      "kids",
+      "homeware",
+      "dresses",
+      "denim",
+      "tops",
+      "bottoms",
+      "accessories",
+      "sale",
+      "collections",
+    ];
+    for (const k of categoryKeywords) {
+      if (url.includes(`/${k}/`) || url.endsWith(`/${k}`)) return "category";
+    }
+    if (url === "/" || url.includes("/home")) return "home";
+    if (
+      url.includes("/search") ||
+      url.includes("/login") ||
+      url.includes("/checkout")
+    )
+      return "other";
+    return "page";
+  }
+
   async function getCartStatusAndItems() {
     try {
-      const res = await fetch('/api/checkout/pub/orderForm', { credentials: 'include' });
-      if (!res.ok) return { cartStatus: 'No cart', items: [] };
+      const res = await fetch("/api/checkout/pub/orderForm", {
+        credentials: "include",
+      });
+      if (!res.ok) return { cartStatus: "No Cart", items: [] };
       const orderForm = await res.json();
-      const items = (orderForm.items || []).map(i => ({
+      const items = (orderForm.items || []).map((i) => ({
         sku: i.id,
         name: i.name,
         qty: i.quantity,
-        price: i.sellingPrice
+        price: i.sellingPrice,
+        brandName: i.brand || "",
       }));
-      return { cartStatus: items.length > 0 ? 'Active cart' : 'No cart', items };
+      return {
+        cartStatus: items.length > 0 ? "Active Cart" : "No Cart",
+        items,
+      };
     } catch (e) {
-      return { cartStatus: 'No cart', items: [] };
+      return { cartStatus: "No Cart", items: [] };
     }
   }
 
   function getProductFromJsonLd() {
     try {
-      const scripts = [...document.querySelectorAll('script[type="application/ld+json"]')];
+      const scripts = [
+        ...document.querySelectorAll('script[type="application/ld+json"]'),
+      ];
       for (const s of scripts) {
         try {
-          const data = JSON.parse(s.textContent || '{}');
+          const data = JSON.parse(s.textContent || "{}");
           const arr = Array.isArray(data) ? data : [data];
           for (const item of arr) {
-            if (item && (item['@type'] === 'Product' || item.name)) {
+            if (item && (item["@type"] === "Product" || item.name)) {
               return {
-                productName: item.name || '',
-                brandName: typeof item.brand === 'string' ? item.brand : item.brand?.name || '',
-                categoryName: item.category || '',
-                productId: item.sku || item.productID || item['@id'] || ''
+                productName: item.name || "",
+                brandName:
+                  typeof item.brand === "string"
+                    ? item.brand
+                    : item.brand?.name || "",
+                categoryName: item.category || "",
+                productId:
+                  item.sku || item.productID || item["@id"] || "",
               };
             }
           }
-        } catch (e) { /* ignore parse errors */ }
+        } catch (e) {}
       }
     } catch (e) {}
     return null;
@@ -75,10 +115,16 @@
 
   async function getSessionEmailAndIds() {
     try {
-      const res = await fetch('/api/sessions?items=profile.id,profile.email,authentication.storeUserEmail', { credentials: 'include' });
+      const res = await fetch(
+        "/api/sessions?items=profile.id,profile.email,authentication.storeUserEmail",
+        { credentials: "include" }
+      );
       if (!res.ok) return { email: null, id: null, sessionId: null };
       const data = await res.json();
-      const email = data?.namespaces?.authentication?.storeUserEmail?.value || data?.namespaces?.profile?.email?.value || null;
+      const email =
+        data?.namespaces?.authentication?.storeUserEmail?.value ||
+        data?.namespaces?.profile?.email?.value ||
+        null;
       const id = data?.namespaces?.profile?.id?.value || null;
       return { email, id, sessionId: data?.id || null };
     } catch (e) {
@@ -86,216 +132,167 @@
     }
   }
 
-  // --- Forwarding bridge to extension background (via window events) ---
   function forwardToExtension(payload) {
     try {
-      const ev = new CustomEvent('WHOLA_SEND_TO_MW', { detail: payload });
+      const ev = new CustomEvent("WHOLA_SEND_TO_MW", { detail: payload });
       window.dispatchEvent(ev);
     } catch (e) {
-      console.warn('[WholaCapture] forwardToExtension failed', e);
+      console.warn("[WholaCapture] forwardToExtension failed", e);
     }
   }
 
-  // --- Core: build payload and forward ---
-  function buildPayload({ email, vtexCustomerId, sessionId, lastActivityType, product, cart }) {
-    return {
-      customerProperties: {
-        email: email || null,
-        vtexCustomerId: vtexCustomerId || null,
-        sessionId: sessionId || null,
-        lastActivityType: lastActivityType || 'Product view'
-      },
-      productProperties: {
-        productName: product.productName || '',
-        brandName: product.brandName || '',
-        categoryName: product.categoryName || '',
-        productId: product.productId || ''
-      },
-      cartProperties: {
-        cartStatus: cart.cartStatus || '',
-        items: cart.items || []
-      }
-    };
-  }
-
-  // --- Login / Logout detection and forced send logic ---
   async function captureAndForwardIfChanged() {
     const session = await getSessionEmailAndIds();
-    const fallbackEmail = localStorage.getItem('whola_email') || null;
+    const fallbackEmail = localStorage.getItem("whola_email") || null;
     const email = session.email || fallbackEmail;
     const vtexCustomerId = session.id || null;
     const sessionId = session.sessionId || null;
 
-    const product = getProductFromJsonLd() || { productName: document.title || '', brandName: '', categoryName: '', productId: '' };
+    let previousEmail = null;
+    try {
+      previousEmail = sessionStorage.getItem(LAST_KNOWN_EMAIL_KEY) || null;
+    } catch (e) {}
+
+    const jsonLdProduct = getProductFromJsonLd();
+    const productCandidate =
+      jsonLdProduct || {
+        productName: "",
+        brandName: "",
+        categoryName: "",
+        productId: "",
+      };
+
     const cart = await getCartStatusAndItems();
 
-    // Detect login/logout by comparing with last known email stored in sessionStorage
-    let lastKnownEmail = null;
+    const pageUrl = window.location.href || window.location.pathname || "";
+    const pageType = detectPageTypeClient(pageUrl, productCandidate);
+
+    // Build conservative productProperties
+    let productProps = {
+      productName: "",
+      brandName: "",
+      categoryName: "",
+      productId: "",
+    };
+    if (pageType === "product") {
+      productProps.productName =
+        productCandidate.productName || document.title || "";
+      productProps.brandName = productCandidate.brandName || "";
+      productProps.categoryName = productCandidate.categoryName || "";
+      productProps.productId = productCandidate.productId || "";
+    } else if (pageType === "brand") {
+      productProps.brandName =
+        productCandidate.brandName ||
+        (document.title || "").split("-")[0].trim() ||
+        "";
+    } else {
+      productProps = {
+        productName: "",
+        brandName: "",
+        categoryName: "",
+        productId: "",
+      };
+    }
+
+    // --- Detect login / logout transitions ---
+    const isLogin = !previousEmail && !!email;
+    const isLogout = !!previousEmail && !email;
+
+    // --- Debounce cart changes: only item count or total value ---
+    const itemsForHash = cart.items || [];
+    const itemCount = itemsForHash.length;
+    const totalCents = itemsForHash.reduce(
+      (acc, it) => acc + Number(it.price || 0) * Number(it.qty || 1),
+      0
+    );
+    const cartSnapshotStr = `${itemCount}|${totalCents}`;
+    const cartHash = hashString(cartSnapshotStr);
+    let previousCartHash = null;
     try {
-      lastKnownEmail = sessionStorage.getItem(LAST_KNOWN_EMAIL_KEY) || null;
-    } catch (e) {
-      lastKnownEmail = null;
+      previousCartHash = localStorage.getItem(LAST_CART_HASH_KEY) || null;
+    } catch (e) {}
+
+    const cartChanged = !!previousCartHash && previousCartHash !== cartHash;
+
+    // Decide lastActivityType
+    let lastActivityType;
+    if (isLogin) {
+      lastActivityType = "Login";
+    } else if (isLogout) {
+      lastActivityType = "Logout";
+    } else if (cartChanged) {
+      lastActivityType = "Cart Updated";
+    } else {
+      lastActivityType = pageType === "product" ? "Product view" : "Page view";
     }
 
-    // Normalize cart status string for decision-making
-    const hasItems = Array.isArray(cart.items) && cart.items.length > 0;
-
-    // If email appeared (login)
-    if (!lastKnownEmail && email) {
-      // Login detected
-      const cartStatus = hasItems ? 'Active Cart' : 'No Cart';
-      const payload = buildPayload({
-        email,
-        vtexCustomerId,
-        sessionId,
-        lastActivityType: 'Login',
-        product,
-        cart: { cartStatus, items: cart.items || [] }
-      });
-      forwardToExtension(payload);
-      // update last-known email
-      try { sessionStorage.setItem(LAST_KNOWN_EMAIL_KEY, email); } catch (e) {}
-      // Also persist last-sent hash so dedupe doesn't block immediate subsequent snapshots
-      try { localStorage.setItem(LAST_SENT_KEY, simpleHash(safeStringify({ type: 'login', email, cartStatus }))); } catch (e) {}
-      return;
+    // Use previousEmail for logout so CartEvents can still associate the contact
+    let effectiveEmail = email;
+    if (!effectiveEmail && isLogout && previousEmail) {
+      effectiveEmail = previousEmail;
     }
 
-    // If email disappeared (logout)
-    if (lastKnownEmail && !email) {
-      // Logout detected
-      const cartStatus = hasItems ? 'Abandoned Cart' : 'No Cart';
-      const payload = buildPayload({
-        email: lastKnownEmail, // use last known email to associate note
-        vtexCustomerId,
-        sessionId,
-        lastActivityType: 'Logout',
-        product,
-        cart: { cartStatus, items: cart.items || [] }
-      });
-      forwardToExtension(payload);
-      // clear last-known email
-      try { sessionStorage.removeItem(LAST_KNOWN_EMAIL_KEY); } catch (e) {}
-      try { localStorage.setItem(LAST_SENT_KEY, simpleHash(safeStringify({ type: 'logout', email: lastKnownEmail, cartStatus }))); } catch (e) {}
-      return;
-    }
-
-    // No login/logout transition — proceed with normal snapshot dedupe for product/cart
-    const snapshot = {
-      email: email || null,
-      product: {
-        productName: product.productName || '',
-        brandName: product.brandName || '',
-        categoryName: product.categoryName || '',
-        productId: product.productId || ''
+    const payload = {
+      customerProperties: {
+        email: effectiveEmail || null,
+        vtexCustomerId: vtexCustomerId || null,
+        sessionId: sessionId || null,
+        lastActivityType,
+        lastVisitedUrl: pageUrl,
+        pageType: pageType,
       },
-      cart: {
-        cartStatus: cart.cartStatus,
-        items: cart.items || []
-      }
+      productProperties: productProps,
+      cartProperties: {
+        cartStatus: cart.cartStatus || "",
+        items: cart.items || [],
+      },
+      jsonLdProduct: jsonLdProduct || null,
+      ts: new Date().toISOString(),
     };
 
-    const snapshotStr = safeStringify(snapshot);
-    const hash = simpleHash(snapshotStr);
+    // dedupe by snapshot hash (email + pageType + product + cart)
+    const snapshotStr = safeStringify({
+      email: payload.customerProperties.email,
+      pageType: payload.customerProperties.pageType,
+      product: payload.productProperties,
+      cart: {
+        itemCount,
+        totalCents,
+      },
+    });
+    const hash = hashString(snapshotStr);
 
     const last = localStorage.getItem(LAST_SENT_KEY);
-
-    // If unchanged, do nothing
-    if (last === hash) {
-      return;
-    }
-
-    // Build payload (product view by default)
-    const payload = buildPayload({
-      email,
-      vtexCustomerId,
-      sessionId,
-      lastActivityType: 'Product view',
-      product,
-      cart
-    });
+    if (last === hash) return;
 
     forwardToExtension(payload);
 
-    // Persist last-sent hash and last-known email
-    try { localStorage.setItem(LAST_SENT_KEY, hash); } catch (e) {}
     try {
-      if (email) sessionStorage.setItem(LAST_KNOWN_EMAIL_KEY, email);
-      else sessionStorage.removeItem(LAST_KNOWN_EMAIL_KEY);
+      localStorage.setItem(LAST_SENT_KEY, hash);
+    } catch (e) {}
+    try {
+      if (email) {
+        // real session email present → treat as logged-in
+        sessionStorage.setItem(LAST_KNOWN_EMAIL_KEY, email);
+      } else {
+        // on logout we clear the stored email
+        sessionStorage.removeItem(LAST_KNOWN_EMAIL_KEY);
+      }
+    } catch (e) {}
+    try {
+      localStorage.setItem(LAST_CART_HASH_KEY, cartHash);
     } catch (e) {}
   }
 
-  // --- Public helpers for manual triggers (exposed to page API) ---
-  async function captureLoginManual() {
-    const session = await getSessionEmailAndIds();
-    const email = session.email || localStorage.getItem('whola_email') || null;
-    const vtexCustomerId = session.id || null;
-    const sessionId = session.sessionId || null;
-    const cart = await getCartStatusAndItems();
-    const hasItems = Array.isArray(cart.items) && cart.items.length > 0;
-    const cartStatus = hasItems ? 'Active Cart' : 'No Cart';
-    const product = getProductFromJsonLd() || { productName: document.title || '', brandName: '', categoryName: '', productId: '' };
-
-    if (!email) {
-      // nothing to do if no email known
-      return { status: 0, error: 'no-email' };
-    }
-
-    const payload = buildPayload({
-      email,
-      vtexCustomerId,
-      sessionId,
-      lastActivityType: 'Login',
-      product,
-      cart: { cartStatus, items: cart.items || [] }
-    });
-
-    forwardToExtension(payload);
-    try { sessionStorage.setItem(LAST_KNOWN_EMAIL_KEY, email); } catch (e) {}
-    return { status: 1 };
-  }
-
-  async function captureLogoutManual() {
-    const session = await getSessionEmailAndIds();
-    const email = sessionStorage.getItem(LAST_KNOWN_EMAIL_KEY) || localStorage.getItem('whola_email') || null;
-    const vtexCustomerId = session.id || null;
-    const sessionId = session.sessionId || null;
-    const cart = await getCartStatusAndItems();
-    const hasItems = Array.isArray(cart.items) && cart.items.length > 0;
-    const cartStatus = hasItems ? 'Abandoned Cart' : 'No Cart';
-    const product = getProductFromJsonLd() || { productName: document.title || '', brandName: '', categoryName: '', productId: '' };
-
-    if (!email) {
-      return { status: 0, error: 'no-email' };
-    }
-
-    const payload = buildPayload({
-      email,
-      vtexCustomerId,
-      sessionId,
-      lastActivityType: 'Logout',
-      product,
-      cart: { cartStatus, items: cart.items || [] }
-    });
-
-    forwardToExtension(payload);
-    try { sessionStorage.removeItem(LAST_KNOWN_EMAIL_KEY); } catch (e) {}
-    return { status: 1 };
-  }
-
-  // --- Init and periodic checks ---
   (function init() {
-    // Run once immediately
     captureAndForwardIfChanged();
-
-    // Periodic check (5s)
     setInterval(captureAndForwardIfChanged, 5000);
-
-    // Expose manual triggers for debugging/testing
     try {
-      window.__WHOLA_CAPTURE_LOGIN__ = captureLoginManual;
-      window.__WHOLA_CAPTURE_LOGOUT__ = captureLogoutManual;
+      window.__WHOLA_CAPTURE_LOGIN__ = captureAndForwardIfChanged;
     } catch (e) {}
   })();
 
-  console.log("[WholaCapture] page-capture loaded (login/logout detection enabled)");
+  console.log(
+    "[WholaCapture] page-capture loaded (conservative product detection + login/logout + cart updates with debounce)"
+  );
 })();
