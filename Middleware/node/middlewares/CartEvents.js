@@ -2,7 +2,12 @@
 
 const deepEqual = require("fast-deep-equal"); // npm i fast-deep-equal
 const { addLog, createLogsSchema } = require("../util/logs");
-const { sendCartToHubSpot } = require("./HubspotService");
+const {
+  sendCartToHubSpot,
+  ensureContactByEmail,
+  getContactPropertiesV3,
+  updateContactPropertiesV3,
+} = require("./HubspotService");
 const { Result } = require("../general/Result");
 
 // In-memory last-cart snapshot per email (short-term). For persistence use masterdata.
@@ -10,6 +15,71 @@ const lastCartByEmail = new Map();
 
 // In-memory last product viewed per email (session-level flag).
 const lastProductViewedByEmail = new Map();
+
+// In-memory last cart/checkout page logged per email (prevents poll loops).
+const lastPageVisitLoggedByEmail = new Map();
+
+// Products already logged this session (keyed by VTEX sessionId or email).
+const sessionProductsVisited = new Map();
+
+function getSessionKey(body) {
+  const sessionId = body?.customerProperties?.sessionId;
+  if (sessionId) return `sid:${sessionId}`;
+  const email = body?.customerProperties?.email;
+  if (email) return `email:${email}`;
+  return null;
+}
+
+function clearSessionProductVisits(body) {
+  const sessionKey = getSessionKey(body);
+  if (sessionKey) sessionProductsVisited.delete(sessionKey);
+}
+
+// One abandoned-cart log per session (reset on login).
+const abandonedCartLoggedBySession = new Map();
+
+function shouldLogAbandonedCart(body) {
+  const sessionKey = getSessionKey(body);
+  if (!sessionKey) return true;
+  if (abandonedCartLoggedBySession.get(sessionKey)) return false;
+  abandonedCartLoggedBySession.set(sessionKey, true);
+  return true;
+}
+
+function clearAbandonedCartLogged(body) {
+  const sessionKey = getSessionKey(body);
+  if (sessionKey) abandonedCartLoggedBySession.delete(sessionKey);
+}
+
+function isAbandonedCartEvent(body, incomingItems) {
+  const hasItems = Array.isArray(incomingItems) && incomingItems.length > 0;
+  if (!hasItems) return false;
+
+  const cartStatus = (body?.cartProperties?.cartStatus || "").toLowerCase();
+  if (cartStatus.includes("abandon")) return true;
+
+  const lastActivity = (body?.customerProperties?.lastActivityType || "").toLowerCase();
+  if (lastActivity.includes("abandon")) return true;
+
+  if (isLogoutEvent(body)) return true;
+
+  return false;
+}
+
+async function logAbandonedCart(body, email, incomingItems) {
+  if (!isAbandonedCartEvent(body, incomingItems)) return;
+  if (!shouldLogAbandonedCart(body)) return;
+  //decrease purchase_intent_score by 5
+  await updateScore(email, "purchase_intent_score", -5);
+  console.log("abandoned cart", email, `| Items in cart: ${incomingItems.length}`);
+}
+
+function shouldLogPageVisit(email, visitType, page) {
+  const key = `${visitType}:${page || ""}`;
+  if (lastPageVisitLoggedByEmail.get(email) === key) return false;
+  lastPageVisitLoggedByEmail.set(email, key);
+  return true;
+}
 
 function isLoginEvent(body) {
   const lastActivity = body?.customerProperties?.lastActivityType?.toLowerCase?.() || "";
@@ -26,16 +96,44 @@ function isProductViewEvent(body) {
   return lastActivity.includes("product view") || lastActivity.includes("product_view") || (lastActivity.includes("product") && lastActivity.includes("view"));
 }
 
+function isCartVisitEvent(body) {
+  const lastActivity = body?.customerProperties?.lastActivityType?.toLowerCase?.() || "";
+  if (
+    lastActivity.includes("cart visit") ||
+    lastActivity.includes("view cart") ||
+    lastActivity.includes("visit cart")
+  ) {
+    return true;
+  }
+
+  const page = (body?.customerProperties?.lastVisitedPage || "").toLowerCase();
+  return page.includes("#/cart");
+}
+
+function isCheckoutVisitEvent(body) {
+  const lastActivity = body?.customerProperties?.lastActivityType?.toLowerCase?.() || "";
+  if (lastActivity.includes("checkout visit")) return true;
+
+  const page = (body?.customerProperties?.lastVisitedPage || "").toLowerCase();
+  return page.includes("#/profile");
+}
+
+function getCartItemKey(item) {
+  return String(item.sku || item.skuId || item.itemId || item.id || item.name || "");
+}
+
 function cartItemsNormalized(cartProperties) {
   const items = (cartProperties && cartProperties.items) || [];
   // normalize to array of {sku, qty, name, price, variant}
-  return items.map(i => ({
-    sku: i.sku || i.skuId || i.itemId || "",
-    qty: Number(i.qty || i.quantity || 1),
-    name: i.name || i.productName || "",
-    price: i.price || 0,
-    variant: i.variant || i.variantName || i.skuVariant || ""
-  }));
+  return items
+    .map(i => ({
+      sku: getCartItemKey(i),
+      qty: Number(i.qty ?? i.quantity ?? 1),
+      name: i.name || i.productName || "",
+      price: i.price || 0,
+      variant: i.variant || i.variantName || i.skuVariant || ""
+    }))
+    .filter(i => i.sku && i.qty > 0);
 }
 
 // Helper: derive a stable product key from the payload (best-effort)
@@ -48,6 +146,49 @@ function getProductKey(body) {
   const cat = p.categoryName || p.category || "";
   const name = p.productName || p.name || "";
   return `${brand}|${cat}|${name}`;
+}
+
+function isLikelyProductPage(body) {
+  const p = body?.productProperties || {};
+  if (p.productId && String(p.productId).trim()) return true;
+
+  const page = (body?.customerProperties?.lastVisitedPage || "").toLowerCase();
+  if (page.endsWith("/p") || page.includes("/p/")) return true;
+
+  return false;
+}
+
+function shouldLogNewProductPageVisit(body, productKey) {
+  const sessionKey = getSessionKey(body);
+  if (!sessionKey || !productKey) return false;
+
+  let visited = sessionProductsVisited.get(sessionKey);
+  if (!visited) {
+    visited = new Set();
+    sessionProductsVisited.set(sessionKey, visited);
+  }
+  if (visited.has(productKey)) return false;
+
+  visited.add(productKey);
+  return true;
+}
+
+async function logNewProductPageVisit(body, email, productKey) {
+  if (!productKey || !isLikelyProductPage(body)) return;
+
+  const productName =
+    body?.productProperties?.productName ||
+    body?.productProperties?.name ||
+    productKey;
+
+  if (shouldLogNewProductPageVisit(body, productKey)) {
+    console.log("new product page visited", email, productName);
+    try {
+      await updateScore(email, "engagement_score", 2);
+    } catch (e) {
+      console.error("[CartEvents] Failed to update engagement_score:", e?.message || e);
+    }
+  }
 }
 
 // Compute delta between two normalized item arrays and return detailed added/removed lists
@@ -115,6 +256,132 @@ function computeCartDeltaDetailed(prevItems = [], newItems = []) {
   return { added, removed, actionType };
 }
 
+const SCORE_BOUNDS = {
+  engagement_score: { min: 0, max: 20 },
+  purchase_intent_score: { min: 0, max: 20 },
+  customer_value_score: { min: 0, max: 20 },
+};
+
+const LEAD_SCORE_FIELDS = [
+  "engagement_score",
+  "purchase_intent_score",
+  "customer_value_score",
+];
+
+function clampScore(value, min, max) {
+  return Math.min(max, Math.max(min, Number(value) || 0));
+}
+
+// HubSpot dropdown option labels (must match portal configuration exactly).
+function getLeadTier(overallLeadScore) {
+  const score = clampScore(overallLeadScore, 0, 60);
+  if (score <= 14) return "Cold Lead";
+  if (score <= 29) return "Marketing Qualified Lead (MQL)";
+  if (score <= 44) return "Sales Qualified Lead (SQL)";
+  return "High-Value Lead";
+}
+
+function buildLeadScoreSnapshot(props, scoreOverrides = {}) {
+  const engagement = clampScore(
+    scoreOverrides.engagement_score ?? props?.engagement_score,
+    SCORE_BOUNDS.engagement_score.min,
+    SCORE_BOUNDS.engagement_score.max
+  );
+  const purchaseIntent = clampScore(
+    scoreOverrides.purchase_intent_score ?? props?.purchase_intent_score,
+    SCORE_BOUNDS.purchase_intent_score.min,
+    SCORE_BOUNDS.purchase_intent_score.max
+  );
+  const customerValue = clampScore(
+    scoreOverrides.customer_value_score ?? props?.customer_value_score,
+    SCORE_BOUNDS.customer_value_score.min,
+    SCORE_BOUNDS.customer_value_score.max
+  );
+  const overallLeadScore = engagement + purchaseIntent + customerValue;
+
+  return {
+    engagement_score: engagement,
+    purchase_intent_score: purchaseIntent,
+    customer_value_score: customerValue,
+    overall_lead_score: overallLeadScore,
+    lead_tier: getLeadTier(overallLeadScore),
+  };
+}
+
+async function updateScore(email, scoreName, delta) {
+  if (!email || !scoreName || delta == null || delta === 0) return;
+
+  const bounds = SCORE_BOUNDS[scoreName];
+  if (!bounds) return;
+
+  const contactId = await ensureContactByEmail(email);
+  if (!contactId) {
+    console.error("[CartEvents] updateScore: no HubSpot contact for", email);
+    return;
+  }
+
+  const props = (await getContactPropertiesV3(contactId, LEAD_SCORE_FIELDS)) || {};
+  const current = clampScore(props[scoreName], bounds.min, bounds.max);
+  const next = clampScore(current + delta, bounds.min, bounds.max);
+  if (next === current) {
+    console.log("[CartEvents] updateScore: no change for", scoreName, `(already ${current})`);
+    return;
+  }
+
+  const snapshot = buildLeadScoreSnapshot(props, { [scoreName]: next });
+
+  const scoreResult = await updateContactPropertiesV3(contactId, { [scoreName]: next });
+  if (!scoreResult.ok) {
+    console.error("[CartEvents] updateScore failed:", scoreName, scoreResult.error);
+    return;
+  }
+
+  const leadResult = await updateContactPropertiesV3(contactId, {
+    overall_lead_score: snapshot.overall_lead_score,
+    lead_tier: snapshot.lead_tier,
+  });
+  if (!leadResult.ok) {
+    console.error("[CartEvents] updateScore: overall_lead_score/lead_tier failed:", leadResult.error);
+  }
+
+  console.log(
+    "[CartEvents] Score updated:",
+    email,
+    `${scoreName}: ${current} -> ${next}`,
+    `overall_lead_score: ${snapshot.overall_lead_score}`,
+    `lead_tier: ${snapshot.lead_tier}`
+  );
+}
+
+async function logCartItemChanges(delta, currentCartItems, email) {
+  const cartItemCount = Array.isArray(currentCartItems) ? currentCartItems.length : 0;
+
+  if (delta.added.length > 0) {
+    console.log(
+      `[CartEvents] Item added to cart (${email}):`,
+      delta.added,
+      `| Total items in cart: ${cartItemCount}`
+    );
+    try {
+      await updateScore(email, "purchase_intent_score", 3);
+    } catch (e) {
+      console.error("[CartEvents] Failed to update purchase_intent_score:", e?.message || e);
+    }
+  }
+  if (delta.removed.length > 0) {
+    console.log(
+      `[CartEvents] Item removed from cart (${email}):`,
+      delta.removed,
+      `| Total items in cart: ${cartItemCount}`
+    );
+    try {
+      await updateScore(email, "purchase_intent_score", -3);
+    } catch (e) {
+      console.error("[CartEvents] Failed to update purchase_intent_score:", e?.message || e);
+    }
+  }
+}
+
 // Optional TTL for product-view session flag (ms). Set to null to never auto-expire during the session.
 const PRODUCT_VIEW_TTL_MS = null;
 
@@ -156,6 +423,7 @@ async function handleLoginOrCartUpdate(ctx, next) {
 
     // 1) Login event
     if (isLoginEvent(body)) {
+      clearAbandonedCartLogged(body);
       console.log(" [CartEvents] Detected login event for", email);
       try {
         // On login: if cart has items -> Active Cart; if no items -> No Cart
@@ -179,6 +447,8 @@ async function handleLoginOrCartUpdate(ctx, next) {
 
     // 1b) Logout event
     if (isLogoutEvent(body)) {
+      clearSessionProductVisits(body);
+      logAbandonedCart(body, email, incomingItems);
       console.log(" [CartEvents] Detected logout event for", email);
       try {
         // On logout: if cart has items -> Abandoned Cart; if no items -> No Cart
@@ -195,6 +465,43 @@ async function handleLoginOrCartUpdate(ctx, next) {
         console.error(" [CartEvents] Error sending logout event to HubSpot:", e);
         result.ok(false);
       }
+      ctx.status = 200;
+      ctx.body = result.data;
+      return;
+    }
+
+    // 1b2) Explicit abandoned cart (e.g. tab close / VTEX webhook — not logout)
+    if (isAbandonedCartEvent(body, incomingItems) && !isLogoutEvent(body)) {
+      logAbandonedCart(body, email, incomingItems);
+      result.ok(true);
+      ctx.status = 200;
+      ctx.body = result.data;
+      return;
+    }
+
+    // 1c) Cart page visit (/checkout/#/cart) or "view cart" click
+    if (isCartVisitEvent(body)) {
+      const page = body?.customerProperties?.lastVisitedPage || "";
+      if (shouldLogPageVisit(email, "cart", page)) {
+        console.log("cart visited", email);
+        //increase purchase_intent_score by 4
+        await updateScore(email, "purchase_intent_score", 4);
+      }
+      result.ok(true);
+      ctx.status = 200;
+      ctx.body = result.data;
+      return;
+    }
+
+    // 1d) Checkout page visit (/checkout/#/profile)
+    if (isCheckoutVisitEvent(body)) {
+      const page = body?.customerProperties?.lastVisitedPage || "";
+      if (shouldLogPageVisit(email, "checkout", page)) {
+        console.log("checkout visited", email);
+        //increase customer_value_score by 5
+        await updateScore(email, "customer_value_score", 5);
+      }
+      result.ok(true);
       ctx.status = 200;
       ctx.body = result.data;
       return;
@@ -224,11 +531,15 @@ async function handleLoginOrCartUpdate(ctx, next) {
       }
     }
 
+    if (productView) {
+      await logNewProductPageVisit(body, email, productKey);
+    }
+
     // compute delta if cart changed
     let delta = { added: [], removed: [], actionType: null };
     if (cartChanged) {
       delta = computeCartDeltaDetailed(prev, normalized);
-      console.log(" [CartEvents] Cart delta for", email, delta);
+      await logCartItemChanges(delta, normalized, email);
       lastCartByEmail.set(email, normalized);
     } else {
       console.log(" [CartEvents] Cart unchanged for", email);

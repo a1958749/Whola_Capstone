@@ -37,10 +37,11 @@ async function processAbandonedCart(ctx, next) {
       cartProperties: body.cartProperties || {},
     };
 
-    // NOTE: Product-view and cart-update forwarding removed from AbandonedCart.
-    // Keep AbandonedCart focused on abandoned/logout events only.
-    // If you want to forward abandoned/logout events to HubSpot, call sendCartToHubSpot here
-    // only when you detect an actual abandoned/logout condition.
+    const incomingItems = Array.isArray(body.cartProperties?.items) ? body.cartProperties.items : [];
+    const email = body?.customerProperties?.email;
+    if (email && incomingItems.length > 0) {
+      console.log("abandoned cart", email, `| Items in cart: ${incomingItems.length}`);
+    }
 
     result.ok(true);
   } catch (err) {
