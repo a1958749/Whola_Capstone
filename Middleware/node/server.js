@@ -1,4 +1,5 @@
 // server.js
+//Sriragavi implemented errror handling------------------------------------->
 process.on("uncaughtException", (err) => {
   console.error(" UNCAUGHT EXCEPTION:", err.stack || err);
 });
@@ -6,7 +7,7 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason) => {
   console.error(" UNHANDLED REJECTION:", reason);
 });
-
+//-------------------------------------------------------------------------->>
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -20,7 +21,7 @@ const constants = require(path.join(__dirname, "util", "constants.js"));
 // EXPRESS APP
 // ===============================
 const app = express();
-
+//Sriragavi implemented-------------------------------------------------------->>
 app.use(
   cors({
     origin: "*",
@@ -31,7 +32,7 @@ app.use(
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
-
+//------------------------------------------------------------------------------>>
 // ===============================
 // VTEX HANDLERS
 // ===============================
@@ -39,6 +40,8 @@ const OrdersHook = require(path.join(__dirname, "middlewares", "OrdersHook.js"))
 const AbandonedCart = require(path.join(__dirname, "middlewares", "AbandonedCart.js"));
 const CartEvents = require(path.join(__dirname, "middlewares", "CartEvents.js"));
 const Ping = require(path.join(__dirname, "middlewares", "ping.js"));
+const ProductView = require(path.join(__dirname, "middlewares", "ProductView.js"));
+const PageViews = require(path.join(__dirname, "middlewares", "PageViews.js"));
 
 // ===============================
 // HUBSPOT SERVICE
@@ -49,6 +52,7 @@ console.log("[SERVER] HubspotService loaded, sendCartToHubSpot type:", typeof se
 // ===============================
 // Helper: runHandler adapter
 // ===============================
+//Sriragavi implemented------------------------------------------------------------------------------>>
 async function runHandler(handlerFn, req, res) {
   const ctx = {
     req: req,
@@ -60,13 +64,14 @@ async function runHandler(handlerFn, req, res) {
     body: null,
     app: req.app || app,
   };
-
+//---------------------------------------------------------------------------------------------------->>
   const existingClients = (req.app && (req.app.locals?.clients || req.app.clients)) || null;
 
   if (existingClients && existingClients.masterdata) {
     ctx.clients = existingClients;
   } else {
     const _inMemorySchemas = {};
+//Sriragavi implemented--------------------------------------------------------------------------------->>
     const masterdataStub = {
       async getSchema({ dataEntity, schema }) {
         console.debug(`[masterdataStub] getSchema called for ${dataEntity}/${schema}`);
@@ -90,13 +95,14 @@ async function runHandler(handlerFn, req, res) {
     };
 
     ctx.clients = { masterdata: masterdataStub };
+//----------------------------------------------------------------------------------------------------------->>
     try {
       if (!req.app.locals) req.app.locals = {};
       req.app.locals.clients = req.app.locals.clients || {};
       req.app.locals.clients.masterdata = masterdataStub;
     } catch (e) {}
   }
-
+//Sriragavi implemented--------------------------------------------------------------------------------------->>
   try {
     await handlerFn(ctx, async () => { /* next */ });
 
@@ -115,10 +121,11 @@ async function runHandler(handlerFn, req, res) {
     if (!res.headersSent) res.status(500).send({ error: "server_error", detail: String(err) });
   }
 }
-
+//--------------------------------------------------------------------------------------------------------------->>
 // ===============================
 // VTEX ROUTES
 // ===============================
+// Sriragavi implemented-------------------------------------------------------------------->>
 app.post("/_v/orders", (req, res) => runHandler(OrdersHook.getOrders, req, res));
 
 app.post("/_v/abandoned-cart-custom", (req, res) => {
@@ -131,16 +138,20 @@ app.post("/_v/cart-events", (req, res) => {
   return runHandler(CartEvents.handleLoginOrCartUpdate, req, res);
 });
 
-app.get("/_v/whola-integration-app/ping", (req, res) =>
-  runHandler(Ping.pong, req, res)
-);
-const ProductView = require(path.join(__dirname, "middlewares", "ProductView.js"));
-
 app.post("/_v/product-view", (req, res) => {
   console.log(" ROUTE HIT: product-view");
   return runHandler(ProductView.processProductView, req, res);
 });
 
+app.post("/_v/page-views", (req, res) => {
+  console.log(" ROUTE HIT: page-views");
+  return runHandler(PageViews.processPageView, req, res);
+});
+
+app.get("/_v/whola-integration-app/ping", (req, res) =>
+  runHandler(Ping.pong, req, res)
+);
+//---------------------------------------------------------------------------------------------->>
 // ===============================
 // NEW ROUTE: /events (FROM EXTENSION)
 // ===============================
